@@ -1,4 +1,5 @@
 ;;; org-roam-ui.el --- User Interface for Org-roam -*- coding: utf-8; lexical-binding: t; -*-
+;; -*- no-byte-compile: t; -*-
 
 ;; Copyright © 2021 Kirill Rogovoy, Thomas F. K. Jorna
 
@@ -47,10 +48,22 @@
 (defvar org-roam-ui-root-dir
   (concat (file-name-directory
            (expand-file-name (or
-                    load-file-name
-                    buffer-file-name)))
+                              load-file-name
+                              buffer-file-name)))
           ".")
   "Root directory of the org-roam-ui project.")
+
+(defvar org-roam-ui-publish-dir
+  (expand-file-name "./publish/" org-roam-ui-root-dir)
+  "Directory containing static site.")
+
+(defvar org-roam-ui-orig-repo-dir
+  org-roam-ui-root-dir
+  "Directory containing static site.")
+
+(defvar org-roam-ui-publish-tags
+  '()
+  "Tags to export to static site.")
 
 (defvar org-roam-ui-app-build-dir
   (expand-file-name "./out/" org-roam-ui-root-dir)
@@ -230,9 +243,9 @@ Takes _WS and FRAME as arguments."
 (defun org-roam-ui--on-msg-open-node (data)
   "Open a node when receiving DATA from the websocket."
   (let* ((id (alist-get 'id data))
-          (node (org-roam-node-from-id id))
-          (pos (org-roam-node-point node))
-          (buf (find-file-noselect (org-roam-node-file node))))
+         (node (org-roam-node-from-id id))
+         (pos (org-roam-node-point node))
+         (buf (find-file-noselect (org-roam-node-file node))))
     (run-hook-with-args 'org-roam-ui-before-open-node-functions id)
     (unless (window-live-p org-roam-ui--window)
       (if-let ((windows (window-list))
@@ -400,8 +413,29 @@ unchanged."
      ("FILELESS" . t))
    'nil))
 
-(defun org-roam-ui--send-graphdata ()
-  "Get roam data, make JSON, send through websocket to org-roam-ui."
+(defun org-roam-ui--get-nodes-by-tags ()
+  "Return all nodes that contain at least one tag in ORG-ROAM-UI-PUBLISH-TAGS."
+  (if org-roam-ui-publish-tags
+      (org-roam-db-query [:select [id
+                                   file
+                                   title
+                                   level
+                                   pos
+                                   olp
+                                   properties
+                                   (funcall group-concat tag
+                                            (emacsql-escape-raw \\\, ))]
+                          :as tags
+                          :from nodes
+                          :left-join tags
+                          :on (= id node_id)
+                          :where (in tag $v1)
+                          :group :by id] (vconcat org-roam-ui-publish-tags))
+    (org-roam-ui--get-nodes)))
+
+(defun org-roam-ui--make-graphdata (export)
+  "Get roam data and make JSON.
+If EXPORT is true nodes are filtered by ORG-ROAM-UI-PUBLISH-TAGS."
   (let* ((nodes-names
           [id
            file
@@ -425,15 +459,17 @@ unchanged."
                                    (lambda (link)
                                      (nth 1 link))
                                    links-with-empty-refs)))
-         (nodes-db-rows (org-roam-ui--get-nodes))
+         (nodes-db-rows (if export
+                            (org-roam-ui--get-nodes-by-tags)
+                          (org-roam-ui--get-nodes)))
          (fake-nodes (seq-map #'org-roam-ui--create-fake-node empty-refs))
-           ;; Try to update real nodes that are reference with a title build
-           ;; from their bibliography entry. Check configuration here for avoid
-           ;; unneeded iteration though nodes.
+         ;; Try to update real nodes that are reference with a title build
+         ;; from their bibliography entry. Check configuration here for avoid
+         ;; unneeded iteration though nodes.
          (retitled-nodes-db-rows (if org-roam-ui-retitle-ref-nodes
-                                    (seq-map #'org-roam-ui--retitle-node
-                                             nodes-db-rows)
-                                  nodes-db-rows))
+                                     (seq-map #'org-roam-ui--retitle-node
+                                              nodes-db-rows)
+                                   nodes-db-rows))
          (complete-nodes-db-rows (append retitled-nodes-db-rows fake-nodes))
          (response `((nodes . ,(mapcar
                                 (apply-partially
@@ -452,10 +488,18 @@ unchanged."
     (when old
       (message "[org-roam-ui] You are not using the latest version of org-roam.
 This database model won't be supported in the future, please consider upgrading."))
-    (websocket-send-text org-roam-ui-ws-socket (json-encode
-                                                `((type . "graphdata")
-                                                  (data . ,response))))))
+    (json-encode
+     `((type . "graphdata")
+       (data . ,response)))))
 
+(defun org-roam-ui--send-graphdata ()
+  "Send roam data through websocket to org-roam-ui."
+  (websocket-send-text org-roam-ui-ws-socket (org-roam-ui--make-graphdata nil)))
+
+(defun org-roam-ui--export-graphdata (file)
+  "Create a FILE in JSON format containting graphdata.
+Calls make-graphdata with export t"
+  (write-region (org-roam-ui--make-graphdata t) nil file))
 
 (defun org-roam-ui--filter-citations (links)
   "Filter out the citations from LINKS."
@@ -467,44 +511,44 @@ This database model won't be supported in the future, please consider upgrading.
 (defun org-roam-ui--get-nodes ()
   "."
   (org-roam-db-query [:select [id
-                                file
-                                title
-                                level
-                                pos
-                                olp
-                                properties
-                                (funcall group-concat tag
-                                         (emacsql-escape-raw \, ))]
-                       :as tags
-                       :from nodes
-                       :left-join tags
-                       :on (= id node_id)
-                       :group :by id]))
+                               file
+                               title
+                               level
+                               pos
+                               olp
+                               properties
+                               (funcall group-concat tag
+                                        (emacsql-escape-raw \, ))]
+                      :as tags
+                      :from nodes
+                      :left-join tags
+                      :on (= id node_id)
+                      :group :by id]))
 
 (defun org-roam-ui--get-links (&optional old)
   "Get the cites and links tables as rows from the org-roam db.
 Optionally set OLD to t to use the old db model (where the cites
 were in the same table as the links)."
-(if (not old)
+  (if (not old)
+      (org-roam-db-query
+       `[:select  [links:source
+                   links:dest
+                   links:type]
+         :from links
+         :where (= links:type "id")])
+    ;; Left outer join on refs means any id link (or cite link without a
+    ;; corresponding node) will have 'nil for the `refs:node-id' value. Any
+    ;; cite link where a node has that `:ROAM_REFS:' will have a value.
     (org-roam-db-query
-     `[:select  [links:source
-                 links:dest
-                 links:type]
+     `[:select [links:source
+                links:dest
+                links:type
+                refs:node-id]
        :from links
-       :where (= links:type "id")])
-  ;; Left outer join on refs means any id link (or cite link without a
-  ;; corresponding node) will have 'nil for the `refs:node-id' value. Any
-  ;; cite link where a node has that `:ROAM_REFS:' will have a value.
-  (org-roam-db-query
-   `[:select [links:source
-              links:dest
-              links:type
-              refs:node-id]
-     :from links
-     :left :outer :join refs :on (= links:dest refs:ref)
-     :where (or
-             (= links:type "id")
-             (like links:type "%cite%"))])))
+       :left :outer :join refs :on (= links:dest refs:ref)
+       :where (or
+               (= links:type "id")
+               (like links:type "%cite%"))])))
 
 (defun org-roam-ui--get-cites ()
   "Get the citations when using the new db-model."
@@ -521,21 +565,21 @@ Convert any cite links that have nodes with associated refs to an
 id based link of type `ref' while removing the 'nil `refs:node-id'
 from all other links."
 
- (if (not old)
+  (if (not old)
+      (seq-map
+       (lambda (link)
+         (pcase-let ((`(,source ,dest ,node-id) link))
+           (if node-id
+               (list source node-id "ref")
+             (list source dest "cite"))))
+       links)
     (seq-map
      (lambda (link)
-       (pcase-let ((`(,source ,dest ,node-id) link))
+       (pcase-let ((`(,source ,dest ,type ,node-id) link))
          (if node-id
              (list source node-id "ref")
-           (list source dest "cite"))))
-     links)
-   (seq-map
-    (lambda (link)
-      (pcase-let ((`(,source ,dest ,type ,node-id) link))
-        (if node-id
-            (list source node-id "ref")
-          (list source dest type))))
-    links)))
+           (list source dest type))))
+     links)))
 
 (defun org-roam-ui--update-current-node ()
   "Send the current node data to the web-socket."
@@ -568,40 +612,40 @@ from all other links."
               (setq ui-theme doom-theme))
           (setq ui-theme (org-roam-ui-get-theme)))
       (when org-roam-ui-custom-theme
-		(setq ui-theme org-roam-ui-custom-theme)))
+	(setq ui-theme org-roam-ui-custom-theme)))
     ui-theme))
 
 
 (defun org-roam-ui--send-variables (ws)
   "Send miscellaneous org-roam variables through the websocket WS."
-    (let ((daily-dir (if (boundp 'org-roam-dailies-directory)
-                         (if (file-name-absolute-p org-roam-dailies-directory)
-                             (expand-file-name org-roam-dailies-directory)
-                           (expand-file-name
-                            org-roam-dailies-directory
-                            org-roam-directory))
-                       "/dailies"))
-          (attach-dir (if (boundp 'org-attach-id-dir)
-                          org-attach-id-dir
-                        (expand-file-name ".attach/" org-directory)))
-          (use-inheritance (if (boundp 'org-attach-use-inheritance)
-                            org-attach-use-inheritance
-                            nil))
-          (sub-dirs (org-roam-ui-find-subdirectories)))
-      (websocket-send-text org-roam-ui-ws-socket
-                           (json-encode
-                            `((type . "variables")
-                              (data .
-                                    (("subDirs".
-                                      ,sub-dirs)
-                                     ("dailyDir" .
-                                      ,daily-dir)
-                                     ("attachDir" .
-                                      ,attach-dir)
-                                     ("useInheritance" .
-                                      ,use-inheritance)
-                                     ("roamDir" . ,org-roam-directory)
-                                     ("katexMacros" . ,org-roam-ui-latex-macros))))))))
+  (let ((daily-dir (if (boundp 'org-roam-dailies-directory)
+                       (if (file-name-absolute-p org-roam-dailies-directory)
+                           (expand-file-name org-roam-dailies-directory)
+                         (expand-file-name
+                          org-roam-dailies-directory
+                          org-roam-directory))
+                     "/dailies"))
+        (attach-dir (if (boundp 'org-attach-id-dir)
+                        org-attach-id-dir
+                      (expand-file-name ".attach/" org-directory)))
+        (use-inheritance (if (boundp 'org-attach-use-inheritance)
+                             org-attach-use-inheritance
+                           nil))
+        (sub-dirs (org-roam-ui-find-subdirectories)))
+    (websocket-send-text org-roam-ui-ws-socket
+                         (json-encode
+                          `((type . "variables")
+                            (data .
+                                  (("subDirs".
+                                    ,sub-dirs)
+                                   ("dailyDir" .
+                                    ,daily-dir)
+                                   ("attachDir" .
+                                    ,attach-dir)
+                                   ("useInheritance" .
+                                    ,use-inheritance)
+                                   ("roamDir" . ,org-roam-directory)
+                                   ("katexMacros" . ,org-roam-ui-latex-macros))))))))
 
 (defun org-roam-ui-sql-to-alist (column-names rows)
   "Convert sql result to alist for json encoding.
@@ -637,10 +681,10 @@ ROWS is the sql result, while COLUMN-NAMES is the columns to use."
 (defun org-roam-ui-find-subdirectories ()
   "Find all the subdirectories in the org-roam directory.
 TODO: Exclude org-attach dirs."
-   (seq-filter
-    (lambda (file) (and (file-directory-p file) (org-roam-ui-allowed-directory-p file)))
-    (directory-files-recursively org-roam-directory
-                                 ".*" t #'org-roam-ui-allowed-directory-p)))
+  (seq-filter
+   (lambda (file) (and (file-directory-p file) (org-roam-ui-allowed-directory-p file)))
+   (directory-files-recursively org-roam-directory
+                                ".*" t #'org-roam-ui-allowed-directory-p)))
 
 (defun org-roam-ui-allowed-directory-p (dir)
   "Check whether a DIR should be listed as a filterable dir.
@@ -656,6 +700,46 @@ Hides . directories."
   (unless org-roam-ui-mode (org-roam-ui-mode))
   (funcall org-roam-ui-browser-function
            (format "http://localhost:%d" org-roam-ui-port)))
+
+;;;###autoload
+(defun org-roam-ui-publish ()
+  "Export `org-roam-ui's-data for usage as static webserver.
+Exports to org-roam-ui-publish-dir.
+If ORG-ROAM-UI-PUBLISH-TAGS set publishes only the nodes with those tags."
+  (interactive)
+  (let* ((graphdata-file (concat (file-name-as-directory org-roam-ui-root-dir) "graphdata.json"))
+         (notes-dir (concat (file-name-as-directory org-roam-ui-root-dir) "notes/")))
+    (org-roam-ui--export-graphdata graphdata-file)
+    (make-directory notes-dir :parents)
+    (mapc (lambda (id)
+            (let* ((cid (car id))
+                   (content (org-roam-ui--get-text cid)))
+              (write-region content nil (concat notes-dir cid) 'append)))
+          (org-roam-ui--get-nodes-by-tags))
+    (message (async-shell-command
+              (format "bash -c %s" (shell-quote-argument
+                                    (concat
+                                     (format "cd %s\n" org-roam-ui-orig-repo-dir)
+                                     (format "mv %s ./\n" graphdata-file)
+                                     (format "mv %s public/\n" notes-dir)
+                                     "patch pages/index.tsx < index.tsx.patch\n"
+                                     "patch util/uniorg.tsx < uniorg.tsx.patch\n"
+                                     "patch components/Sidebar/OrgImage.tsx < OrgImage.tsx.patch\n"
+                                     "patch components/Sidebar/Link.tsx < Link.tsx.patch\n"
+                                     "echo building...\n"
+                                     "yarnpkg\n"
+                                     "yarnpkg build\n"
+                                     "yarnpkg export\n"
+                                     (format "rm -r %s\n" org-roam-ui-publish-dir)
+                                     (format "cp -r out/ %s\n" org-roam-ui-publish-dir)
+                                     "echo cleaning...\n"
+                                     "patch -R pages/index.tsx < index.tsx.patch\n"
+                                     "patch -R util/uniorg.tsx < uniorg.tsx.patch\n"
+                                     "patch -R components/Sidebar/OrgImage.tsx < OrgImage.tsx.patch\n"
+                                     "patch -R components/Sidebar/Link.tsx < Link.tsx.patch\n"
+                                     "rm -r public/notes/ graphdata.json\n"
+                                     "echo done.\n")))))))
+
 
 ;;;###autoload
 (defun org-roam-ui-node-zoom (&optional id speed padding)
